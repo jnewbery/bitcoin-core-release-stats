@@ -6,6 +6,7 @@ from collections import defaultdict
 import configparser
 import csv
 import json
+import multiprocessing
 import os
 import requests
 import subprocess
@@ -17,9 +18,18 @@ class Github():
         self.client_id = client_id
         self.client_secret = client_secret
 
-    def request(self, req):
+    def request(self, req, options=None):
         """makes request to the github API."""
-        return json.loads(requests.get('https://api.github.com/{}?client_id={}&client_secret={}'.format(req, self.client_id, self.client_secret)).text)
+        if options is None:
+            options = []
+        options += ["client_id={}".format(self.client_id), "client_secret={}".format(self.client_secret)]
+        uri = "https://api.github.com/{}?{}".format(req, "&".join(options))
+
+        return requests.get(uri)
+
+    def get_prs(self, page):
+        resp = self.request('repos/bitcoin/bitcoin/pulls', ["state=closed", "per_page=100", "page={}".format(page)])
+        return json.loads(resp.text)
 
 def main():
 
@@ -30,18 +40,40 @@ def main():
 
     bitcoin_dir = config["DEFAULT"]["bitcoin_directory"]
 
+    gh = Github(config["DEFAULT"]["client_id"], config["DEFAULT"]["client_secret"])
+
+    # Check our Github API rate limit
+    rate_limit = gh.request('rate_limit')
+    print(rate_limit)
+
+    # Get all merged PRs in the repo. Assume there are less than 1000
+    with multiprocessing.Pool(100) as p:
+        resps = p.map(gh.get_prs, range(100))
+        assert len(resps[-1]) == 0, "More than 10,000 PRs have been merged. Increase number of requests"
+        prs = [pr for prs in resps for pr in prs]
+
+    merged_prs = [pr for pr in prs if pr['merged_at'] is not None and pr['base']['ref'] == 'master']
+    print([pr['number'] for pr in merged_prs])
+
+    contributors = defaultdict(int)
+    pulls = []
+    # Read PRs merged in this release
+    with open('PRs_15.txt', 'r', encoding='utf-8') as f:
+        for l in f:
+            pulls.append(l.rstrip())
+
     for release in config.sections():
         # Each non-default section in the config file is a new release
         prev_branch = config[release]["previous_branch"]
         branch = config[release]["branch"]
 
         # Get number of non-merge commits in this release
-        commits_cmd = "git -C {} -P log {}..{} --oneline --no-merges | wc -l".format(bitcoin_dir, prev_branch, branch)
+        commits_cmd = "git -C {} --no-pager log {}..{} --oneline --no-merges | wc -l".format(bitcoin_dir, prev_branch, branch)
         commits = subprocess.run(commits_cmd, shell=True, universal_newlines=True, stdout=subprocess.PIPE).stdout.rstrip("\n")
 
         # Get number of PRs merged in the release.
         # This is highly dependent on the log message format. TODO: Improve this by using the github API to find out when PRs were merged to master
-        merges_cmd = "git -C {} -P log {}..{} --oneline | grep \"Merge #\" | grep -v \"Revert \\\"Merge\" | cut -f 3 -d \" \" | cut -c 2- | cut -f 1 -d \":\" | sort -n | wc -l".format(bitcoin_dir, prev_branch, branch)
+        merges_cmd = "git -C {} --no-pager log {}..{} --oneline | grep \"Merge #\" | grep -v \"Revert \\\"Merge\" | cut -f 3 -d \" \" | cut -c 2- | cut -f 1 -d \":\" | sort -n | wc -l".format(bitcoin_dir, prev_branch, branch)
         merges = subprocess.run(merges_cmd, shell=True, universal_newlines=True, stdout=subprocess.PIPE).stdout.rstrip("\n")
 
         # Get commit authors
@@ -61,24 +93,12 @@ def main():
 
         print("Most prolific committers:\n {}".format("\n".join(authors_by_commit)))
 
-    gh = Github(config["DEFAULT"]["client_id"], config["DEFAULT"]["client_secret"])
-
-    contributors = defaultdict(int)
-    pulls = []
-    # Read PRs merged in this release
-    with open('PRs_15.txt', 'r', encoding='utf-8') as f:
-        for l in f:
-            pulls.append(l.rstrip())
-
-    # Check our Github API rate limit
-    rate_limit = gh.request('rate_limit')
-    print(rate_limit)
 
     for pr in pulls:
         print("PR {}".format(pr))
         # Get PR comments and review comments
-        pr_comments = gh.request('repos/bitcoin/bitcoin/issues/{}/comments'.format(pr))
-        review_comments = gh.request('repos/bitcoin/bitcoin/pulls/{}/comments'.format(pr))
+        pr_comments = json.loads(gh.request('repos/bitcoin/bitcoin/issues/{}/comments'.format(pr)).text)
+        review_comments = json.loads(gh.request('repos/bitcoin/bitcoin/pulls/{}/comments'.format(pr)).text)
         if pr_comments:
             print("{} pr comments for {}".format(len(pr_comments), pr))
             for comment in pr_comments:
