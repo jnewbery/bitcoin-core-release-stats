@@ -6,11 +6,12 @@ from collections import defaultdict
 import configparser
 import csv
 import json
-import multiprocessing
 import os
 import requests
 import subprocess
+import time
 
+# TODO: don't use the github API for requesting PRs, comments, etc. Use the bitcoin-gh-meta data dump. It's much faster.
 class Github():
     # Handles requests to the github API
 
@@ -22,17 +23,26 @@ class Github():
         """makes request to the github API."""
         if options is None:
             options = []
-        options += ["client_id={}".format(self.client_id), "client_secret={}".format(self.client_secret)]
-        uri = "https://api.github.com/{}?{}".format(req, "&".join(options))
+        uri = "https://api.github.com/{}".format(req)
 
-        return requests.get(uri)
+        return requests.get(uri, auth=(self.client_id, self.client_secret))
 
     def get_prs(self, page):
-        resp = self.request('repos/bitcoin/bitcoin/pulls', ["state=closed", "per_page=100", "page={}".format(page)])
-        return json.loads(resp.text)
+        for i in range(5):
+            resp = self.request('repos/bitcoin/bitcoin/pulls', ["state=closed", "per_page=100", "page={}".format(page)])
+            if resp.status_code == 200:
+                break
+            time.sleep(1)
+        if resp.status_code != 200:
+            print("Failed to request page {}. Response code {}".format(page, resp.status_code))
+        ret = json.loads(resp.text)
+        print("Page {}. Received {} PRs. First = {}; Last = {}".format(page, len(ret), ret[0]['number'], ret[-1]['number']))
+        return ret
+
+def parse_pr(pr):
+    return f"{pr['number']},{pr['user']['login']},{pr['state']},{pr['created_at']},{pr['closed_at']}"
 
 def main():
-
     # Read config file
     config = configparser.ConfigParser()
     configfile = os.path.abspath(os.path.dirname(__file__)) + "/config.ini"
@@ -44,13 +54,22 @@ def main():
 
     # Check our Github API rate limit
     rate_limit = gh.request('rate_limit')
-    print(rate_limit)
+    print("API rate limit stats: {}".format(json.loads(rate_limit.content)['resources']['core']))
 
-    # Get all merged PRs in the repo. Assume there are less than 1000
-    with multiprocessing.Pool(100) as p:
-        resps = p.map(gh.get_prs, range(100))
-        assert len(resps[-1]) == 0, "More than 10,000 PRs have been merged. Increase number of requests"
-        prs = [pr for prs in resps for pr in prs]
+    # for page in itertools.count(1):
+    resps = []
+    for page in range(3):
+        resps += gh.get_prs(page)
+        if len(resps) == 0:
+            break
+
+    prs = [parse_pr(pr) for pr in resps]
+
+    # PER_PAGE = 100
+    # with multiprocessing.Pool(POOL_WORKERS) as p:
+    #     resps = p.map(gh.get_prs, range(PER_PAGE))
+    #     # assert len(resps[-1]) == 0, "More than 10,000 PRs have been merged. Increase number of requests"
+    #     prs = [pr for prs in resps for pr in prs]
 
     merged_prs = [pr for pr in prs if pr['merged_at'] is not None and pr['base']['ref'] == 'master']
     print([pr['number'] for pr in merged_prs])
@@ -92,7 +111,6 @@ def main():
         authors_by_commit = subprocess.run(authors_by_commit_cmd, shell=True, universal_newlines=True, stdout=subprocess.PIPE).stdout.splitlines()[0:10]
 
         print("Most prolific committers:\n {}".format("\n".join(authors_by_commit)))
-
 
     for pr in pulls:
         print("PR {}".format(pr))
